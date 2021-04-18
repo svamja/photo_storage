@@ -12,29 +12,24 @@ const PhotoStorage = {
     /*
         Complete workflow
         
-        *  create bucket on google storage
-        *  create .env file with BUCKET_NAME=<your-bucket-name> at root of this project
-        1. create google console credentials (Create Credentials > OAuth > Desktop Application)
-        2. download credentials file as ".google_credentials.json"
-        3. create google service account and key (Create Credentials > Service Account)
-        4. download and save the key as ".google_service_key.json"
-        5. run indexStorage()
-            use below command to execute:
-                npx run-method index indexStorage
-            this will index your google storage backed up photos to mongodb collection 
-            named "storage_files" under database "photo_storage".
-        6. run indexPhotos()
-            use below command to execute:
-                npx run-method index indexPhotos
-            this will index your google photos to mongodb collection 
-            named "photos_files" under database "photo_storage".
-        7. run backup()
-            use below command to execute:
-                npx run-method index backup
-            this will copy photos from google photos to google storage
-            and updates database.
-        8. rerun indexPhotos() and backup() every few days
-            to continue backing up
+        * create bucket on google storage
+        * create .env file with BUCKET_NAME=<your-bucket-name> at root of this project
+        * (optionally) updat .env file with BUCKET_PREFIX to provide folder path. default = photos.
+        * create google console credentials (Create Credentials > OAuth > Desktop Application)
+            permission to read Google Photos Library
+        * download credentials file as ".google_credentials.json"
+        * create google service account and key (Create Credentials > Service Account)
+            permission to upload to Cloud Storage
+        * download and save the key as ".google_service_key.json"
+        * run backup() - use below command to execute:
+            npx run-method index backup
+          This will copy photos from google photos to google storage
+            and update database.
+          It will time out after 1 minute. You can run it for longer by passing number
+          of minutes, eg:
+            npx run-method index backup 10
+        * keep running it until it catches up
+        * run it every day / week to backup up new photos
 
     */
 
@@ -46,6 +41,7 @@ const PhotoStorage = {
         mongodbUrl: process.env.MONGODB_URL || 'mongodb://localhost',
         mongodbDbName: process.env.MONGODB_DB_NAME || 'photo_storage',
         tmpPath: __dirname + '/tmp',
+        folderStyle: process.env.FOLDER_STYLE || 'monthly',
     },
 
     async getGoogleClient() {
@@ -80,45 +76,6 @@ const PhotoStorage = {
         this.isTimedCountsActive = false;
     },
 
-    // WIP
-    async indexStorage() {
-
-        const moment = require('moment');
-        if(!this.storage) {
-            const keyFilename = this.options.serviceKeyPath;
-            this.storage = new Storage({ keyFilename });
-        }
-
-        MongodbModel.init(this.options.mongodbUrl, this.options.mongodbDbName);
-        this.StorageFiles = await MongodbModel.model('StorageFiles');
-        this.counts = { pages: 0, in: 0, out: 0 };
-
-        const bucketName = this.options.bucketName;
-        let options = {};
-        if(this.options.bucketPath) {
-            options.prefix = this.options.bucketPath;
-        }
-        const [ files ] = await this.storage.bucket(bucketName).getFiles(options);
-        for(let file of files) {
-            this.counts.in++;
-            let { name, size, md5Hash, crc32c, timeCreated } = file.metadata;
-            let created = moment(timeCreated).valueOf();
-            let storage_file = {
-                name: path.basename(name),
-                path: name,
-                size: parseInt(size),
-                md5Hash,
-                crc32c,
-                created
-            };
-            await this.StorageFiles.insertOne(storage_file);
-            console.log(storage_file);
-            this.counts.out++;
-        }
-        await MongodbModel.close();
-        return this.counts;
-    },
-
     async backup(minutes = 1) {
 
         MongodbModel.init(this.options.mongodbUrl, this.options.mongodbDbName);
@@ -134,7 +91,6 @@ const PhotoStorage = {
         let pages = 0;
         minutes = parseFloat(minutes);
         this.expiry = new Date().getTime() + minutes*60000;
-        console.log('expiry', this.expiry);
 
         while(true) {
             this.counts.pages++;
@@ -170,18 +126,16 @@ const PhotoStorage = {
         for(let item of photos) {
             this.counts.in++;
             // Insert into database if not present
-            let find_photo = await this.PhotosFiles.findOne({ filename: item.filename });
-            if(!find_photo) {
+            let photo = await this.PhotosFiles.findOne({ filename: item.filename });
+            if(!photo) {
                 await this.PhotosFiles.insertOne(item);
                 this.counts.new++;
+                photo = await this.PhotosFiles.findOne({ filename: item.filename });
             }
-            let photo = await this.PhotosFiles.findOne({ filename: item.filename });
             if(photo.storage && photo.storage.path) {
-                // Uploaded
                 this.counts.present--;
                 continue;
             }
-            console.log(item.filename, item.mediaMetadata.creationTime);
             await this.backupPhoto(photo);
             if(new Date().getTime() >= this.expiry) {
                 break;
@@ -193,10 +147,9 @@ const PhotoStorage = {
 
         // Initialize
         const localPath = this.options.tmpPath + '/' + photo.filename;
-        const creationTime = photo.mediaMetadata.creationTime;
-        const creationYear = creationTime.substring(0, 4);
         const bucket = this.options.bucketName;
-        const destination = this.options.bucketPath + creationYear + '/' + photo.filename;
+        const destination = this.getTargetPath(photo);
+        console.log(destination)
 
         // Storage Client
         if(!this.storage) {
@@ -224,6 +177,24 @@ const PhotoStorage = {
             { '$set': { storage: { uploaded: new Date().getTime(), path: destination } } 
         });
         this.counts.out++;
+    },
+
+    getTargetPath(photo) {
+        consteationTime = photo.mediaMetadata.creationTime;
+        const year = creationTime.substring(0, 4);
+        const month = creationTime.substring(5, 7);
+        const bucket = this.options.bucketName;
+        let targetPath;
+        if(this.options.folderStyle == 'monthly') {
+            targetPath = this.options.bucketPath + year + '/' + month + '/' + photo.filename;
+        }
+        else if(this.options.folderStyle == 'yearly') {
+            targetPath = this.options.bucketPath + year + '/' + photo.filename;
+        }
+        else {
+            targetPath = this.options.bucketPath + photo.filename;
+        }
+        return targetPath;
     },
 
     async downloadUrl(url, localPath) {
