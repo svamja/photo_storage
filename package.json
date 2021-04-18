@@ -1,0 +1,18 @@
+{
+  "name": "photo-storage",
+  "version": "1.0.0",
+  "description": "Store google photos onto google storage",
+  "main": "index.js",
+  "dependencies": {
+    "@google-cloud/storage": "^5.8.2",
+    "dotenv": "^8.2.0",
+    "nodejs-mongodb-model": "^1.0.0",
+    "run-method": "^1.0.0"
+  },
+  "devDependencies": {},
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "Sanjay Vamja",
+  "license": "MIT"
+}

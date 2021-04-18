@@ -1,0 +1,8 @@
+# Dependency directories
+node_modules/
+
+# google credential file
+.google*.json
+
+# Env File
+.env
