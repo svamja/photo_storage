@@ -1,9 +1,10 @@
 
 require('dotenv').config();
 
-const MongodbModel = require('../../nodejs-mongodb-model');
+const MongodbModel = require('nodejs-mongodb-model');
 const { Storage } = require('@google-cloud/storage');
 const fs = require('fs');
+const path = require('path');
 const https = require('https');
 
 const PhotoStorage = {
@@ -44,6 +45,7 @@ const PhotoStorage = {
         bucketPath: process.env.BUCKET_PREFIX || '',
         mongodbUrl: process.env.MONGODB_URL || 'mongodb://localhost',
         mongodbDbName: process.env.MONGODB_DB_NAME || 'photo_storage',
+        tmpPath: __dirname + '/tmp',
     },
 
     async getGoogleClient() {
@@ -80,98 +82,117 @@ const PhotoStorage = {
 
     // WIP
     async indexStorage() {
-        console.log(this.options);
+
+        const moment = require('moment');
+        if(!this.storage) {
+            const keyFilename = this.options.serviceKeyPath;
+            this.storage = new Storage({ keyFilename });
+        }
 
         MongodbModel.init(this.options.mongodbUrl, this.options.mongodbDbName);
+        this.StorageFiles = await MongodbModel.model('StorageFiles');
         this.counts = { pages: 0, in: 0, out: 0 };
 
-        this.StorageFiles = await MongodbModel.model('StorageFiles');
-        let item = {
-            name: 'abc.jpg'
-        };
-        await this.StorageFiles.insertOne(item);
+        const bucketName = this.options.bucketName;
+        let options = {};
+        if(this.options.bucketPath) {
+            options.prefix = this.options.bucketPath;
+        }
+        const [ files ] = await this.storage.bucket(bucketName).getFiles(options);
+        for(let file of files) {
+            this.counts.in++;
+            let { name, size, md5Hash, crc32c, timeCreated } = file.metadata;
+            let created = moment(timeCreated).valueOf();
+            let storage_file = {
+                name: path.basename(name),
+                path: name,
+                size: parseInt(size),
+                md5Hash,
+                crc32c,
+                created
+            };
+            await this.StorageFiles.insertOne(storage_file);
+            console.log(storage_file);
+            this.counts.out++;
+        }
         await MongodbModel.close();
         return this.counts;
-
     },
 
-    async indexPhotos() {
+    async backup(minutes = 1) {
 
         MongodbModel.init(this.options.mongodbUrl, this.options.mongodbDbName);
 
+        this.StorageFiles = await MongodbModel.model('StorageFiles');
         this.PhotosFiles = await MongodbModel.model('PhotosFiles');
-        await this.PhotosFiles.deleteMany();
 
-        this.counts = { pages: 0, in: 0, out: 0 };
+        this.counts = { pages: 0, in: 0, new: 0, present: 0, out: 0 };
 
-        this.startTimedCounts();
+        this.startTimedCounts(10); // Report counts every 10 seconds
 
         let pageToken;
         let pages = 0;
+        minutes = parseFloat(minutes);
+        this.expiry = new Date().getTime() + minutes*60000;
+        console.log('expiry', this.expiry);
 
         while(true) {
             this.counts.pages++;
-            response = await this.listPhotos(pageToken);
+            response = await this.getPhotosByPage(pageToken);
             items = response.mediaItems;
-            this.counts.in += items.length;
-            await this.PhotosFiles.insertMany(items);
-            this.counts.out += items.length;
-            if(items[0].mediaMetadata && items[0].mediaMetadata.creationTime) {
-                this.counts.lastCreated = items[0].mediaMetadata && items[0].mediaMetadata.creationTime;
-            }
+            await this.backupChunk(items);
             pageToken = response.nextPageToken;
             if(!pageToken) {
                 break;
             }
-            break; //debug
+            if(new Date().getTime() >= this.expiry) {
+                break;
+            }
         }
 
         this.stopTimedCounts();
-        console.log(this.counts);
         await MongodbModel.close();
-
         return this.counts;
 
     },
 
-    async listPhotos(pageToken) {
+    async getPhotosByPage(pageToken) {
         const client = await this.getGoogleClient();
         const url = 'https://photoslibrary.googleapis.com/v1/mediaItems';
         const pageSize = 100;
         const params = { pageSize, pageToken };
         const response = await client.request({ url, params });
-        await this.sleep(5);
+        await this.sleep(5); // maintain API rate
         return response.data;
     },
 
-    // WIP
-    async backup() {
-
-        const Photos = await MongodbModel.model('Photos');
-        const photos = await Photos.find();
-        this.counts = { in: 0, previous: 0, out: 0 };
-        this.startTimedCounts();
-        for await(let photo of photos) {
-            if(photo.uploaded) {
-                this.counts.previous++;
+    async backupChunk(photos) {
+        for(let item of photos) {
+            this.counts.in++;
+            console.log(item.filename, item.mediaMetadata.creationTime);
+            // Insert into database if not present
+            let find_photo = await this.PhotosFiles.findOne({ filename: item.filename });
+            if(!find_photo) {
+                await this.PhotosFiles.insertOne(item);
+                this.counts.new++;
+            }
+            let photo = await this.PhotosFiles.findOne({ filename: item.filename });
+            if(photo.storage && photo.storage.path) {
+                // Uploaded
+                this.counts.present--;
                 continue;
             }
-            this.counts.in++;
-            console.log(photo.filename);
             await this.backupPhoto(photo);
-            await Photos.updateOne({ _id: photo._id }, { '$set': { uploaded: true } });
-            this.counts.out++;
-            break; // debug
+            if(new Date().getTime() >= this.expiry) {
+                break;
+            }
         }
-        await MongodbModel.close();
-        this.stopTimedCounts();
-        return this.counts;
     },
 
     async backupPhoto(photo) {
 
         // Initialize
-        const localPath = photo.filename;
+        const localPath = this.options.tmpPath + '/' + photo.filename;
         const creationTime = photo.mediaMetadata.creationTime;
         const creationYear = creationTime.substring(0, 4);
         const bucket = this.options.bucketName;
@@ -184,23 +205,50 @@ const PhotoStorage = {
         }
 
         // Download Photo
-        console.log('downloading', photo.filename, creationTime);
         const photo_url = photo.baseUrl + '=d';
-        const file = fs.createWriteStream(localPath);
-        const request = https.get(photo_url, response => response.pipe(file));
+        await this.downloadUrl(photo_url, localPath);
+        await App.sleep(3); // maintain download rate
+
+        // Verify Download
+        const fileStats = fs.statSync(localPath);
+        if(fileStats.size < 100) {
+            throw new Error('unable to download ' + photo.filename);
+        }
 
         // Upload to Bucket
         await this.storage.bucket(bucket).upload(localPath, { destination });
-        console.log(`uploaded`);
 
-    }
+        // Update Database
+        await this.PhotosFiles.updateOne(
+            { _id: photo._id },
+            { '$set': { storage: { uploaded: new Date().getTime(), path: destination } } 
+        });
+        this.counts.out++;
+    },
+
+    async downloadUrl(url, localPath) {
+        return new Promise(function(resolve, reject) {
+            const file = fs.createWriteStream(localPath);
+            const request = https.get(url, function(response) {
+                if (response.statusCode < 200 || response.statusCode >= 300) {
+                    return reject(new Error('statusCode=' + response.statusCode));
+                }
+                response.pipe(file);
+                response.on('end', function() {
+                    resolve();
+                });
+            })
+            .on('error', function(error) {
+                reject(error);
+            });
+            request.end();
+        });
+    },
 
 };
 
 if(!module.parent) {
     (async function() {
-        await PhotoStorage.indexStorage();
-        await PhotoStorage.indexPhotos();
         await PhotoStorage.backup();
     })();
 }
