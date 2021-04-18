@@ -169,7 +169,6 @@ const PhotoStorage = {
     async backupChunk(photos) {
         for(let item of photos) {
             this.counts.in++;
-            console.log(item.filename, item.mediaMetadata.creationTime);
             // Insert into database if not present
             let find_photo = await this.PhotosFiles.findOne({ filename: item.filename });
             if(!find_photo) {
@@ -182,6 +181,7 @@ const PhotoStorage = {
                 this.counts.present--;
                 continue;
             }
+            console.log(item.filename, item.mediaMetadata.creationTime);
             await this.backupPhoto(photo);
             if(new Date().getTime() >= this.expiry) {
                 break;
@@ -207,7 +207,7 @@ const PhotoStorage = {
         // Download Photo
         const photo_url = photo.baseUrl + '=d';
         await this.downloadUrl(photo_url, localPath);
-        await App.sleep(3); // maintain download rate
+        await this.sleep(3); // maintain download rate
 
         // Verify Download
         const fileStats = fs.statSync(localPath);
