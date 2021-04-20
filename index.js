@@ -80,7 +80,6 @@ const PhotoStorage = {
 
         MongodbModel.init(this.options.mongodbUrl, this.options.mongodbDbName);
 
-        this.StorageFiles = await MongodbModel.model('StorageFiles');
         this.PhotosFiles = await MongodbModel.model('PhotosFiles');
 
         this.counts = { pages: 0, in: 0, new: 0, present: 0, out: 0 };
@@ -114,28 +113,50 @@ const PhotoStorage = {
 
     async getPhotosByPage(pageToken) {
         const client = await this.getGoogleClient();
-        const url = 'https://photoslibrary.googleapis.com/v1/mediaItems';
+        const url = 'https://photoslibrary.googleapis.com/v1/mediaItems:search';
         const pageSize = 100;
-        const params = { pageSize, pageToken };
-        const response = await client.request({ url, params });
-        await this.sleep(5); // maintain API rate
+        const method = 'POST';
+        let data;
+        const filters = {
+            dateFilter: {
+              ranges: [
+                {
+                  startDate: { year: 1990, month: 1, day: 1 },
+                  endDate: { year: 2050, month: 12, day: 31 }
+                }
+              ]
+            }
+        };
+        data = { pageSize, pageToken, filters };
+        const response = await client.request({ url, method, data });
+        await this.sleep(2); // maintain API rate
         return response.data;
     },
 
     async backupChunk(photos) {
         for(let item of photos) {
             this.counts.in++;
-            // Insert into database if not present
-            let photo = await this.PhotosFiles.findOne({ filename: item.filename });
+            // Insert/Update
+            item.updated = new Date().getTime();
+            await this.PhotosFiles.updateOne(
+                { id: item.id },
+                { '$set': item },
+                { upsert: true }
+            );
+
+            // Retrieve
+            let photo = await this.PhotosFiles.findOne({ id: item.id });
             if(!photo) {
-                await this.PhotosFiles.insertOne(item);
-                this.counts.new++;
-                photo = await this.PhotosFiles.findOne({ filename: item.filename });
+                throw new Error('unable to upsert ' + item.id);
             }
+
+            // If Backed up Before, Skip
             if(photo.storage && photo.storage.path) {
                 this.counts.present--;
                 continue;
             }
+
+            // Take Backup
             await this.backupPhoto(photo);
             if(new Date().getTime() >= this.expiry) {
                 break;
@@ -180,7 +201,7 @@ const PhotoStorage = {
     },
 
     getTargetPath(photo) {
-        consteationTime = photo.mediaMetadata.creationTime;
+        const creationTime = photo.mediaMetadata.creationTime;
         const year = creationTime.substring(0, 4);
         const month = creationTime.substring(5, 7);
         const bucket = this.options.bucketName;
@@ -202,7 +223,7 @@ const PhotoStorage = {
             const file = fs.createWriteStream(localPath);
             const request = https.get(url, function(response) {
                 if (response.statusCode < 200 || response.statusCode >= 300) {
-                    return reject(new Error('statusCode=' + response.statusCode));
+                    return reject(new Error('statusCode ' + response.statusCode));
                 }
                 response.pipe(file);
                 response.on('end', function() {
