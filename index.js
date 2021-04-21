@@ -6,31 +6,13 @@ const { Storage } = require('@google-cloud/storage');
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const moment = require('moment');
+const _ = require('lodash');
 
 const PhotoStorage = {
 
     /*
-        Complete workflow
-        
-        * create bucket on google storage
-        * create .env file with BUCKET_NAME=<your-bucket-name> at root of this project
-        * (optionally) updat .env file with BUCKET_PREFIX to provide folder path. default = photos.
-        * create google console credentials (Create Credentials > OAuth > Desktop Application)
-            permission to read Google Photos Library
-        * download credentials file as ".google_credentials.json"
-        * create google service account and key (Create Credentials > Service Account)
-            permission to upload to Cloud Storage
-        * download and save the key as ".google_service_key.json"
-        * run backup() - use below command to execute:
-            npx run-method index backup
-          This will copy photos from google photos to google storage
-            and update database.
-          It will time out after 1 minute. You can run it for longer by passing number
-          of minutes, eg:
-            npx run-method index backup 10
-        * keep running it until it catches up
-        * run it every day / week to backup up new photos
-
+        Complete Workflow - See README.md
     */
 
     options: {
@@ -76,9 +58,10 @@ const PhotoStorage = {
         this.isTimedCountsActive = false;
     },
 
-    async backup(minutes = 1) {
+    async backup(minutes = 1, preview = 'N') {
 
         MongodbModel.init(this.options.mongodbUrl, this.options.mongodbDbName);
+        this.preview = (preview.toLowerCase()[0] === 'y');
 
         this.PhotosFiles = await MongodbModel.model('PhotosFiles');
 
@@ -134,8 +117,12 @@ const PhotoStorage = {
     },
 
     async backupChunk(photos) {
+
+        // Backup
         for(let item of photos) {
+
             this.counts.in++;
+
             // Insert/Update
             item.updated = new Date().getTime();
             await this.PhotosFiles.updateOne(
@@ -156,6 +143,9 @@ const PhotoStorage = {
                 continue;
             }
 
+            // Backup File Name
+            await this.backupFilename(photo);
+
             // Take Backup
             await this.backupPhoto(photo);
             if(new Date().getTime() >= this.expiry) {
@@ -164,13 +154,52 @@ const PhotoStorage = {
         }
     },
 
+    async getPhoto(filename = null) {
+        MongodbModel.init(this.options.mongodbUrl, this.options.mongodbDbName);
+        this.PhotosFiles = this.PhotosFiles || await MongodbModel.model('PhotosFiles');
+        let query = filename ? { filename } : {};
+        return await this.PhotosFiles.findOne(query);
+    },
+
+    async backupFilename(photo) {
+
+        MongodbModel.init(this.options.mongodbUrl, this.options.mongodbDbName);
+        this.PhotosFiles = this.PhotosFiles || await MongodbModel.model('PhotosFiles');
+
+        let query = { filename: photo.filename, id: { '$ne' : photo.id } };
+        let duplicate = await this.PhotosFiles.findOne(query);
+        if(!duplicate) {
+            photo.backup_filename = photo.filename;
+            return photo;
+        }
+        let ext = path.extname(photo.filename);
+        let basename = path.basename(photo.filename, ext);
+        let timestamp = moment(photo.mediaMetadata.creationTime).format('YYYY-MM-DD-HHmmss');
+        let counter = 0;
+        let backup_filename;
+        while(duplicate) {
+            if(counter) {
+                backup_filename = basename + '-' + timestamp + '-' + counter + ext;
+            }
+            else {
+                backup_filename = basename + '-' + timestamp + ext;
+            }
+            query = { filename: backup_filename, id: { '$ne' : photo.id } };
+            duplicate = await this.PhotosFiles.findOne(query);
+            counter++;
+        }
+        photo.backup_filename = backup_filename;
+        return photo;
+    },
+
     async backupPhoto(photo) {
 
         // Initialize
-        const localPath = this.options.tmpPath + '/' + photo.filename;
+        const backup_filename = photo.backup_filename || photo.filename;
+        const localPath = this.options.tmpPath + '/' + backup_filename;
         const bucket = this.options.bucketName;
         const destination = this.getTargetPath(photo);
-        console.log(destination)
+        console.log(photo.filename, '=>', destination);
 
         // Storage Client
         if(!this.storage) {
@@ -179,24 +208,36 @@ const PhotoStorage = {
         }
 
         // Download Photo
-        const photo_url = photo.baseUrl + '=d';
-        await this.downloadUrl(photo_url, localPath);
+        if(!this.preview) {
+            const photo_url = photo.baseUrl + '=d';
+            await this.downloadUrl(photo_url, localPath);
+        }
         await this.sleep(3); // maintain download rate
 
         // Verify Download
-        const fileStats = fs.statSync(localPath);
-        if(fileStats.size < 100) {
-            throw new Error('unable to download ' + photo.filename);
+        if(!this.preview) {
+            const fileStats = fs.statSync(localPath);
+            if(fileStats.size < 100) {
+                throw new Error('unable to download ' + photo.filename);
+            }
         }
 
         // Upload to Bucket
-        await this.storage.bucket(bucket).upload(localPath, { destination });
+        if(!this.preview) {
+            await this.storage.bucket(bucket).upload(localPath, { destination });
+        }
 
         // Update Database
-        await this.PhotosFiles.updateOne(
-            { _id: photo._id },
-            { '$set': { storage: { uploaded: new Date().getTime(), path: destination } } 
-        });
+        if(!this.preview) {
+            await this.PhotosFiles.updateOne(
+                { _id: photo._id },
+                { '$set': { storage: { 
+                    uploaded: new Date().getTime(),
+                    filename: photo.backup_filename,
+                    path: destination 
+                } } 
+            });
+        }
         this.counts.out++;
     },
 
@@ -205,15 +246,16 @@ const PhotoStorage = {
         const year = creationTime.substring(0, 4);
         const month = creationTime.substring(5, 7);
         const bucket = this.options.bucketName;
+        const backup_filename = photo.backup_filename || photo.filename;
         let targetPath;
         if(this.options.folderStyle == 'monthly') {
-            targetPath = this.options.bucketPath + year + '/' + month + '/' + photo.filename;
+            targetPath = this.options.bucketPath + year + '/' + month + '/' + backup_filename;
         }
         else if(this.options.folderStyle == 'yearly') {
-            targetPath = this.options.bucketPath + year + '/' + photo.filename;
+            targetPath = this.options.bucketPath + year + '/' + backup_filename;
         }
         else {
-            targetPath = this.options.bucketPath + photo.filename;
+            targetPath = this.options.bucketPath + backup_filename;
         }
         return targetPath;
     },
